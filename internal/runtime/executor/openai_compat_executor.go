@@ -10,13 +10,13 @@ import (
 	"strings"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
-	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -114,6 +114,10 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 		}
 	}
 	translated = e.applyCompatSafetyMargin(auth, translated)
+	translated, err = e.normalizeToolCallReasoningContent(translated)
+	if err != nil {
+		return resp, err
+	}
 	url := strings.TrimSuffix(baseURL, "/") + endpoint
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(translated))
 	if err != nil {
@@ -217,6 +221,10 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	// Request usage data in the final streaming chunk so that token statistics
 	// are captured even when the upstream is an OpenAI-compatible provider.
 	translated, _ = sjson.SetBytes(translated, "stream_options.include_usage", true)
+	translated, err = e.normalizeToolCallReasoningContent(translated)
+	if err != nil {
+		return nil, err
+	}
 
 	url := strings.TrimSuffix(baseURL, "/") + "/chat/completions"
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(translated))
@@ -300,7 +308,9 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 				if bytes.HasPrefix(trimmedLine, []byte("{")) || bytes.HasPrefix(trimmedLine, []byte("[")) {
 					streamErr := statusErr{code: http.StatusBadGateway, msg: string(trimmedLine)}
 					helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
+
 					reporter.publishFailure(ctx)
+
 					select {
 					case out <- cliproxyexecutor.StreamChunk{Err: streamErr}:
 					case <-ctx.Done():
@@ -322,7 +332,9 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		}
 		if errScan := scanner.Err(); errScan != nil {
 			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
+
 			reporter.publishFailure(ctx)
+
 			select {
 			case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
 			case <-ctx.Done():
@@ -378,7 +390,9 @@ func (e *OpenAICompatExecutor) CountTokens(ctx context.Context, auth *cliproxyau
 // Refresh is a no-op for API-key based compatibility providers.
 func (e *OpenAICompatExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {
 	log.Debugf("openai compat executor: refresh called")
-	_ = ctx
+	if refreshed, handled, err := helps.RefreshAuthViaHome(ctx, e.cfg, auth); handled {
+		return refreshed, err
+	}
 	return auth, nil
 }
 
@@ -444,6 +458,17 @@ func (e *OpenAICompatExecutor) applyCompatSafetyMargin(auth *cliproxyauth.Auth, 
 		return payload
 	}
 	return updated
+}
+
+func (e *OpenAICompatExecutor) normalizeToolCallReasoningContent(payload []byte) ([]byte, error) {
+	updated, patched, err := normalizeOpenAIToolCallReasoningContent(payload, true)
+	if err != nil {
+		return payload, fmt.Errorf("openai compat executor: normalize reasoning_content: %w", err)
+	}
+	if patched > 0 {
+		log.WithField("patched_reasoning_messages", patched).Debug("openai compat executor: normalized tool-call reasoning_content")
+	}
+	return updated, nil
 }
 
 func (e *OpenAICompatExecutor) overrideModel(payload []byte, model string) []byte {

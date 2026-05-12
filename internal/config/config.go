@@ -14,7 +14,7 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/crypto/bcrypt"
 	"gopkg.in/yaml.v3"
@@ -23,6 +23,7 @@ import (
 const (
 	DefaultPanelGitHubRepository = "https://github.com/router-for-me/Cli-Proxy-API-Management-Center"
 	DefaultPprofAddr             = "127.0.0.1:8316"
+	DefaultAuthDir               = "~/.cli-proxy-api"
 )
 
 // Config represents the application's configuration, loaded from a YAML file.
@@ -36,6 +37,9 @@ type Config struct {
 
 	// TLS config controls HTTPS server settings.
 	TLS TLSConfig `yaml:"tls" json:"tls"`
+
+	// Home config enables the Redis-based control plane integration.
+	Home HomeConfig `yaml:"home" json:"-"`
 
 	// RemoteManagement nests management-related options under 'remote-management'.
 	RemoteManagement RemoteManagement `yaml:"remote-management" json:"-"`
@@ -128,6 +132,9 @@ type Config struct {
 
 	// Codex defines a list of Codex API key configurations as specified in the YAML configuration file.
 	CodexKey []CodexKey `yaml:"codex-api-key" json:"codex-api-key"`
+
+	// OllamaKey defines Ollama Cloud API key configurations.
+	OllamaKey []OllamaKey `yaml:"ollama-api-key" json:"ollama-api-key"`
 
 	// CodexHeaderDefaults configures fallback headers for Codex OAuth model requests.
 	// These are used only when the client does not send its own headers.
@@ -267,12 +274,6 @@ type RoutingConfig struct {
 
 	// FallbackMaxDepth limits the number of fallback attempts (default: 3).
 	FallbackMaxDepth int `yaml:"fallback-max-depth,omitempty" json:"fallback-max-depth,omitempty"`
-
-	// ClaudeCodeSessionAffinity enables session-sticky routing for Claude Code clients.
-	// When enabled, requests with the same session ID (extracted from metadata.user_id)
-	// are routed to the same auth credential when available.
-	// Deprecated: Use SessionAffinity instead for universal session support.
-	ClaudeCodeSessionAffinity bool `yaml:"claude-code-session-affinity,omitempty" json:"claude-code-session-affinity,omitempty"`
 
 	// SessionAffinity enables universal session-sticky routing for all clients.
 	// Session IDs are extracted from multiple sources:
@@ -511,6 +512,9 @@ type ClaudeKey struct {
 	// ExcludedModels lists model IDs that should be excluded for this provider.
 	ExcludedModels []string `yaml:"excluded-models,omitempty" json:"excluded-models,omitempty"`
 
+	// DisableCooling disables auth/model cooldown scheduling for this credential when true.
+	DisableCooling bool `yaml:"disable-cooling,omitempty" json:"disable-cooling,omitempty"`
+
 	// Cloak configures request cloaking for non-Claude-Code clients.
 	Cloak *CloakConfig `yaml:"cloak,omitempty" json:"cloak,omitempty"`
 
@@ -568,6 +572,9 @@ type CodexKey struct {
 
 	// ExcludedModels lists model IDs that should be excluded for this provider.
 	ExcludedModels []string `yaml:"excluded-models,omitempty" json:"excluded-models,omitempty"`
+
+	// DisableCooling disables auth/model cooldown scheduling for this credential when true.
+	DisableCooling bool `yaml:"disable-cooling,omitempty" json:"disable-cooling,omitempty"`
 }
 
 func (k CodexKey) GetAPIKey() string  { return k.APIKey }
@@ -584,6 +591,48 @@ type CodexModel struct {
 
 func (m CodexModel) GetName() string  { return m.Name }
 func (m CodexModel) GetAlias() string { return m.Alias }
+
+// OllamaKey represents the configuration for an Ollama Cloud API key.
+type OllamaKey struct {
+	// APIKey is the authentication key for accessing Ollama Cloud.
+	APIKey string `yaml:"api-key" json:"api-key"`
+
+	// Priority controls selection preference when multiple credentials match.
+	Priority int `yaml:"priority,omitempty" json:"priority,omitempty"`
+
+	// Prefix optionally namespaces models for this credential.
+	Prefix string `yaml:"prefix,omitempty" json:"prefix,omitempty"`
+
+	// BaseURL is the Ollama API endpoint. If empty, https://ollama.com/api is used.
+	BaseURL string `yaml:"base-url,omitempty" json:"base-url,omitempty"`
+
+	// ProxyURL overrides the global proxy setting for this API key if provided.
+	ProxyURL string `yaml:"proxy-url,omitempty" json:"proxy-url,omitempty"`
+
+	// BillingClass classifies this credential for threshold-based routing policies.
+	BillingClass BillingClass `yaml:"billing-class,omitempty" json:"billing-class,omitempty"`
+
+	// Models defines upstream model names and aliases for request routing.
+	Models []OllamaModel `yaml:"models,omitempty" json:"models,omitempty"`
+
+	// Headers optionally adds extra HTTP headers for requests sent with this key.
+	Headers map[string]string `yaml:"headers,omitempty" json:"headers,omitempty"`
+
+	// ExcludedModels lists model IDs that should be excluded for this provider.
+	ExcludedModels []string `yaml:"excluded-models,omitempty" json:"excluded-models,omitempty"`
+}
+
+func (k OllamaKey) GetAPIKey() string  { return k.APIKey }
+func (k OllamaKey) GetBaseURL() string { return k.BaseURL }
+
+// OllamaModel describes a mapping between an alias and the actual upstream model name.
+type OllamaModel struct {
+	Name  string `yaml:"name" json:"name"`
+	Alias string `yaml:"alias" json:"alias"`
+}
+
+func (m OllamaModel) GetName() string  { return m.Name }
+func (m OllamaModel) GetAlias() string { return m.Alias }
 
 // GeminiKey represents the configuration for a Gemini API key,
 // including optional overrides for upstream base URL, proxy routing, and headers.
@@ -614,6 +663,9 @@ type GeminiKey struct {
 
 	// ExcludedModels lists model IDs that should be excluded for this provider.
 	ExcludedModels []string `yaml:"excluded-models,omitempty" json:"excluded-models,omitempty"`
+
+	// DisableCooling disables auth/model cooldown scheduling for this credential when true.
+	DisableCooling bool `yaml:"disable-cooling,omitempty" json:"disable-cooling,omitempty"`
 }
 
 func (k GeminiKey) GetAPIKey() string  { return k.APIKey }
@@ -706,6 +758,9 @@ type OpenAICompatibility struct {
 
 	// Headers optionally adds extra HTTP headers for requests sent to this provider.
 	Headers map[string]string `yaml:"headers,omitempty" json:"headers,omitempty"`
+
+	// DisableCooling disables auth/model cooldown scheduling for this provider when true.
+	DisableCooling bool `yaml:"disable-cooling,omitempty" json:"disable-cooling,omitempty"`
 }
 
 // OpenAICompatibilityAPIKey represents an API key configuration with optional proxy setting.
@@ -857,6 +912,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 
 	// Sanitize Codex keys: drop entries without base-url
 	cfg.SanitizeCodexKeys()
+
+	// Sanitize Ollama keys.
+	cfg.SanitizeOllamaKeys()
 
 	// Sanitize Codex header defaults.
 	cfg.SanitizeCodexHeaderDefaults()
@@ -1116,6 +1174,36 @@ func (cfg *Config) SanitizeCodexKeys() {
 		out = append(out, e)
 	}
 	cfg.CodexKey = out
+}
+
+// SanitizeOllamaKeys normalizes Ollama credentials and drops entries without API keys.
+func (cfg *Config) SanitizeOllamaKeys() {
+	if cfg == nil {
+		return
+	}
+
+	seen := make(map[string]struct{}, len(cfg.OllamaKey))
+	out := cfg.OllamaKey[:0]
+	for i := range cfg.OllamaKey {
+		entry := cfg.OllamaKey[i]
+		entry.APIKey = strings.TrimSpace(entry.APIKey)
+		if entry.APIKey == "" {
+			continue
+		}
+		entry.Prefix = normalizeModelPrefix(entry.Prefix)
+		entry.BaseURL = strings.TrimSpace(entry.BaseURL)
+		entry.ProxyURL = strings.TrimSpace(entry.ProxyURL)
+		entry.BillingClass = normalizeBillingClass(entry.BillingClass)
+		entry.Headers = NormalizeHeaders(entry.Headers)
+		entry.ExcludedModels = NormalizeExcludedModels(entry.ExcludedModels)
+		key := strings.ToLower(entry.APIKey) + "\x00" + strings.ToLower(entry.BaseURL)
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, entry)
+	}
+	cfg.OllamaKey = out
 }
 
 // SanitizeClaudeKeys normalizes headers for Claude credentials.
